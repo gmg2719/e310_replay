@@ -22,6 +22,7 @@ module e31x_core #(
   parameter NUM_RADIO_CORES = 1,
   parameter NUM_CHANNELS_PER_RADIO = 2,
   parameter NUM_CHANNELS = 2,
+  parameter USE_REPLAY = 1,
   parameter NUM_DBOARDS = 1,
   parameter FP_GPIO_WIDTH = 8,  // Front panel GPIO width
   parameter DB_GPIO_WIDTH = 16  // Daughterboard GPIO width
@@ -31,7 +32,8 @@ module e31x_core #(
   input radio_rst,
   input bus_clk,
   input bus_rst,
-
+  input ddr3_dma_clk,
+  
   // Motherboard Registers: AXI lite interface
   input                    s_axi_aclk,
   input                    s_axi_aresetn,
@@ -56,6 +58,53 @@ module e31x_core #(
   output [1:0]             s_axi_rresp,
   output                   s_axi_rvalid,
   input                    s_axi_rready,
+
+ // AXI4 DDR3 Interface
+  input          ddr3_axi_clk,
+  input          ddr3_axi_rst,
+  input          ddr3_running,
+  // Write Address Ports
+  output [3:0]   ddr3_axi_awid,
+  output [31:0]  ddr3_axi_awaddr,
+  output [7:0]   ddr3_axi_awlen,
+  output [2:0]   ddr3_axi_awsize,
+  output [1:0]   ddr3_axi_awburst,
+  output [0:0]   ddr3_axi_awlock,
+  output [3:0]   ddr3_axi_awcache,
+  output [2:0]   ddr3_axi_awprot,
+  output [3:0]   ddr3_axi_awqos,
+  output         ddr3_axi_awvalid,
+  input          ddr3_axi_awready,
+  // Write Data Ports
+  output [127:0] ddr3_axi_wdata,
+  output [15:0]  ddr3_axi_wstrb,
+  output         ddr3_axi_wlast,
+  output         ddr3_axi_wvalid,
+  input          ddr3_axi_wready,
+  // Write Response Ports
+  output         ddr3_axi_bready,
+  input [3:0]    ddr3_axi_bid,
+  input [1:0]    ddr3_axi_bresp,
+  input          ddr3_axi_bvalid,
+  // Read Address Ports
+  output [3:0]   ddr3_axi_arid,
+  output [31:0]  ddr3_axi_araddr,
+  output [7:0]   ddr3_axi_arlen,
+  output [2:0]   ddr3_axi_arsize,
+  output [1:0]   ddr3_axi_arburst,
+  output [0:0]   ddr3_axi_arlock,
+  output [3:0]   ddr3_axi_arcache,
+  output [2:0]   ddr3_axi_arprot,
+  output [3:0]   ddr3_axi_arqos,
+  output         ddr3_axi_arvalid,
+  input          ddr3_axi_arready,
+  // Read Data Ports
+  output         ddr3_axi_rready,
+  input [3:0]    ddr3_axi_rid,
+  input [127:0]  ddr3_axi_rdata,
+  input [1:0]    ddr3_axi_rresp,
+  input          ddr3_axi_rlast,
+  input          ddr3_axi_rvalid,
 
   // PPS and Clock Control
   input            pps_refclk,
@@ -130,7 +179,7 @@ module e31x_core #(
   /////////////////////////////////////////////////////////////////////////////////
 
   // Computation engines that need access to IO
-  localparam NUM_IO_CE = NUM_RADIO_CORES; //NUM_RADIO_CORES
+  localparam NUM_IO_CE = NUM_RADIO_CORES + 1; //NUM_RADIO_CORES
   // Radio NOC ID
   localparam NOC_ID_RADIO = 64'h12AD_1000_0000_3310;
 
@@ -441,14 +490,14 @@ module e31x_core #(
     .ce_clk(radio_clk),
     .ce_rst(radio_rst),
     //AXIS data to/from crossbar
-    .i_tdata(ioce_o_tdata[0]),
-    .i_tlast(ioce_o_tlast[0]),
-    .i_tvalid(ioce_o_tvalid[0]),
-    .i_tready(ioce_o_tready[0]),
-    .o_tdata(ioce_i_tdata[0]),
-    .o_tlast(ioce_i_tlast[0]),
-    .o_tvalid(ioce_i_tvalid[0]),
-    .o_tready(ioce_i_tready[0]),
+    .i_tdata(ioce_o_tdata[1]),
+    .i_tlast(ioce_o_tlast[1]),
+    .i_tvalid(ioce_o_tvalid[1]),
+    .i_tready(ioce_o_tready[1]),
+    .o_tdata(ioce_i_tdata[1]),
+    .o_tlast(ioce_i_tlast[1]),
+    .o_tvalid(ioce_i_tvalid[1]),
+    .o_tready(ioce_i_tready[1]),
     // Radio front-end
     .rx({rx_data[1],rx_data[0]}),
     .rx_stb({rx_stb[1], rx_stb[0]}),
@@ -542,6 +591,424 @@ module e31x_core #(
       );
     end
   endgenerate
+
+
+
+  /////////////////////////////////////////////////////////////////////////////
+  //
+  // DRAM
+  //
+  /////////////////////////////////////////////////////////////////////////////
+
+  localparam NUM_DRAM_FIFOS = 2;
+  localparam DRAM_FIFO_INPUT_BUFF_SIZE = 8'd13;
+
+  wire ddr3_dma_rst;
+
+  synchronizer #(
+    .INITIAL_VAL(1'b1)
+  ) ddr3_dma_rst_sync_i (
+    .clk(ddr3_dma_clk), .rst(1'b0), .in(ddr3_axi_rst), .out(ddr3_dma_rst)
+  );
+
+  // AXI4 MM buses
+  wire [0:0]  fifo_axi_awid     [0:NUM_DRAM_FIFOS-1];
+  wire [31:0] fifo_axi_awaddr   [0:NUM_DRAM_FIFOS-1];
+  wire [7:0]  fifo_axi_awlen    [0:NUM_DRAM_FIFOS-1];
+  wire [2:0]  fifo_axi_awsize   [0:NUM_DRAM_FIFOS-1];
+  wire [1:0]  fifo_axi_awburst  [0:NUM_DRAM_FIFOS-1];
+  wire [0:0]  fifo_axi_awlock   [0:NUM_DRAM_FIFOS-1];
+  wire [3:0]  fifo_axi_awcache  [0:NUM_DRAM_FIFOS-1];
+  wire [2:0]  fifo_axi_awprot   [0:NUM_DRAM_FIFOS-1];
+  wire [3:0]  fifo_axi_awqos    [0:NUM_DRAM_FIFOS-1];
+  wire [3:0]  fifo_axi_awregion [0:NUM_DRAM_FIFOS-1];
+  wire [0:0]  fifo_axi_awuser   [0:NUM_DRAM_FIFOS-1];
+  wire        fifo_axi_awvalid  [0:NUM_DRAM_FIFOS-1];
+  wire        fifo_axi_awready  [0:NUM_DRAM_FIFOS-1];
+  wire [63:0] fifo_axi_wdata    [0:NUM_DRAM_FIFOS-1];
+  wire [7:0]  fifo_axi_wstrb    [0:NUM_DRAM_FIFOS-1];
+  wire        fifo_axi_wlast    [0:NUM_DRAM_FIFOS-1];
+  wire [0:0]  fifo_axi_wuser    [0:NUM_DRAM_FIFOS-1];
+  wire        fifo_axi_wvalid   [0:NUM_DRAM_FIFOS-1];
+  wire        fifo_axi_wready   [0:NUM_DRAM_FIFOS-1];
+  wire [0:0]  fifo_axi_bid      [0:NUM_DRAM_FIFOS-1];
+  wire [1:0]  fifo_axi_bresp    [0:NUM_DRAM_FIFOS-1];
+  wire [0:0]  fifo_axi_buser    [0:NUM_DRAM_FIFOS-1];
+  wire        fifo_axi_bvalid   [0:NUM_DRAM_FIFOS-1];
+  wire        fifo_axi_bready   [0:NUM_DRAM_FIFOS-1];
+  wire [0:0]  fifo_axi_arid     [0:NUM_DRAM_FIFOS-1];
+  wire [31:0] fifo_axi_araddr   [0:NUM_DRAM_FIFOS-1];
+  wire [7:0]  fifo_axi_arlen    [0:NUM_DRAM_FIFOS-1];
+  wire [2:0]  fifo_axi_arsize   [0:NUM_DRAM_FIFOS-1];
+  wire [1:0]  fifo_axi_arburst  [0:NUM_DRAM_FIFOS-1];
+  wire [0:0]  fifo_axi_arlock   [0:NUM_DRAM_FIFOS-1];
+  wire [3:0]  fifo_axi_arcache  [0:NUM_DRAM_FIFOS-1];
+  wire [2:0]  fifo_axi_arprot   [0:NUM_DRAM_FIFOS-1];
+  wire [3:0]  fifo_axi_arqos    [0:NUM_DRAM_FIFOS-1];
+  wire [3:0]  fifo_axi_arregion [0:NUM_DRAM_FIFOS-1];
+  wire [0:0]  fifo_axi_aruser   [0:NUM_DRAM_FIFOS-1];
+  wire        fifo_axi_arvalid  [0:NUM_DRAM_FIFOS-1];
+  wire        fifo_axi_arready  [0:NUM_DRAM_FIFOS-1];
+  wire [0:0]  fifo_axi_rid      [0:NUM_DRAM_FIFOS-1];
+  wire [63:0] fifo_axi_rdata    [0:NUM_DRAM_FIFOS-1];
+  wire [1:0]  fifo_axi_rresp    [0:NUM_DRAM_FIFOS-1];
+  wire        fifo_axi_rlast    [0:NUM_DRAM_FIFOS-1];
+  wire [0:0]  fifo_axi_ruser    [0:NUM_DRAM_FIFOS-1];
+  wire        fifo_axi_rvalid   [0:NUM_DRAM_FIFOS-1];
+  wire        fifo_axi_rready   [0:NUM_DRAM_FIFOS-1];
+
+  axi_intercon_4x64_256_bd_wrapper axi_intercon_2x64_256_bd_i (
+    .S00_AXI_ACLK     (ddr3_dma_clk        ),
+    .S00_AXI_ARESETN  (~ddr3_dma_rst       ),
+    .S00_AXI_awid     (fifo_axi_awid    [0]),
+    .S00_AXI_awaddr   (fifo_axi_awaddr  [0]),
+    .S00_AXI_awlen    (fifo_axi_awlen   [0]),
+    .S00_AXI_awsize   (fifo_axi_awsize  [0]),
+    .S00_AXI_awburst  (fifo_axi_awburst [0]),
+    .S00_AXI_awlock   (fifo_axi_awlock  [0]),
+    .S00_AXI_awcache  (fifo_axi_awcache [0]),
+    .S00_AXI_awprot   (fifo_axi_awprot  [0]),
+    .S00_AXI_awqos    (fifo_axi_awqos   [0]),
+    .S00_AXI_awregion (fifo_axi_awregion[0]),
+    .S00_AXI_awvalid  (fifo_axi_awvalid [0]),
+    .S00_AXI_awready  (fifo_axi_awready [0]),
+    .S00_AXI_wdata    (fifo_axi_wdata   [0]),
+    .S00_AXI_wstrb    (fifo_axi_wstrb   [0]),
+    .S00_AXI_wlast    (fifo_axi_wlast   [0]),
+    .S00_AXI_wvalid   (fifo_axi_wvalid  [0]),
+    .S00_AXI_wready   (fifo_axi_wready  [0]),
+    .S00_AXI_bid      (fifo_axi_bid     [0]),
+    .S00_AXI_bresp    (fifo_axi_bresp   [0]),
+    .S00_AXI_bvalid   (fifo_axi_bvalid  [0]),
+    .S00_AXI_bready   (fifo_axi_bready  [0]),
+    .S00_AXI_arid     (fifo_axi_arid    [0]),
+    .S00_AXI_araddr   (fifo_axi_araddr  [0]),
+    .S00_AXI_arlen    (fifo_axi_arlen   [0]),
+    .S00_AXI_arsize   (fifo_axi_arsize  [0]),
+    .S00_AXI_arburst  (fifo_axi_arburst [0]),
+    .S00_AXI_arlock   (fifo_axi_arlock  [0]),
+    .S00_AXI_arcache  (fifo_axi_arcache [0]),
+    .S00_AXI_arprot   (fifo_axi_arprot  [0]),
+    .S00_AXI_arqos    (fifo_axi_arqos   [0]),
+    .S00_AXI_arregion (fifo_axi_arregion[0]),
+    .S00_AXI_arvalid  (fifo_axi_arvalid [0]),
+    .S00_AXI_arready  (fifo_axi_arready [0]),
+    .S00_AXI_rid      (fifo_axi_rid     [0]),
+    .S00_AXI_rdata    (fifo_axi_rdata   [0]),
+    .S00_AXI_rresp    (fifo_axi_rresp   [0]),
+    .S00_AXI_rlast    (fifo_axi_rlast   [0]),
+    .S00_AXI_rvalid   (fifo_axi_rvalid  [0]),
+    .S00_AXI_rready   (fifo_axi_rready  [0]),
+    //
+    .S01_AXI_ACLK     (ddr3_dma_clk        ),
+    .S01_AXI_ARESETN  (~ddr3_dma_rst       ),
+    .S01_AXI_awid     (fifo_axi_awid    [1]),
+    .S01_AXI_awaddr   (fifo_axi_awaddr  [1]),
+    .S01_AXI_awlen    (fifo_axi_awlen   [1]),
+    .S01_AXI_awsize   (fifo_axi_awsize  [1]),
+    .S01_AXI_awburst  (fifo_axi_awburst [1]),
+    .S01_AXI_awlock   (fifo_axi_awlock  [1]),
+    .S01_AXI_awcache  (fifo_axi_awcache [1]),
+    .S01_AXI_awprot   (fifo_axi_awprot  [1]),
+    .S01_AXI_awqos    (fifo_axi_awqos   [1]),
+    .S01_AXI_awregion (fifo_axi_awregion[1]),
+    .S01_AXI_awvalid  (fifo_axi_awvalid [1]),
+    .S01_AXI_awready  (fifo_axi_awready [1]),
+    .S01_AXI_wdata    (fifo_axi_wdata   [1]),
+    .S01_AXI_wstrb    (fifo_axi_wstrb   [1]),
+    .S01_AXI_wlast    (fifo_axi_wlast   [1]),
+    .S01_AXI_wvalid   (fifo_axi_wvalid  [1]),
+    .S01_AXI_wready   (fifo_axi_wready  [1]),
+    .S01_AXI_bid      (fifo_axi_bid     [1]),
+    .S01_AXI_bresp    (fifo_axi_bresp   [1]),
+    .S01_AXI_bvalid   (fifo_axi_bvalid  [1]),
+    .S01_AXI_bready   (fifo_axi_bready  [1]),
+    .S01_AXI_arid     (fifo_axi_arid    [1]),
+    .S01_AXI_araddr   (fifo_axi_araddr  [1]),
+    .S01_AXI_arlen    (fifo_axi_arlen   [1]),
+    .S01_AXI_arsize   (fifo_axi_arsize  [1]),
+    .S01_AXI_arburst  (fifo_axi_arburst [1]),
+    .S01_AXI_arlock   (fifo_axi_arlock  [1]),
+    .S01_AXI_arcache  (fifo_axi_arcache [1]),
+    .S01_AXI_arprot   (fifo_axi_arprot  [1]),
+    .S01_AXI_arqos    (fifo_axi_arqos   [1]),
+    .S01_AXI_arregion (fifo_axi_arregion[1]),
+    .S01_AXI_arvalid  (fifo_axi_arvalid [1]),
+    .S01_AXI_arready  (fifo_axi_arready [1]),
+    .S01_AXI_rid      (fifo_axi_rid     [1]),
+    .S01_AXI_rdata    (fifo_axi_rdata   [1]),
+    .S01_AXI_rresp    (fifo_axi_rresp   [1]),
+    .S01_AXI_rlast    (fifo_axi_rlast   [1]),
+    .S01_AXI_rvalid   (fifo_axi_rvalid  [1]),
+    .S01_AXI_rready   (fifo_axi_rready  [1]),
+    //
+    .S02_AXI_ACLK     (ddr3_dma_clk        ),
+    .S02_AXI_ARESETN  (~ddr3_dma_rst       ),
+    .S02_AXI_awid     (fifo_axi_awid    [2]),
+    .S02_AXI_awaddr   (fifo_axi_awaddr  [2]),
+    .S02_AXI_awlen    (fifo_axi_awlen   [2]),
+    .S02_AXI_awsize   (fifo_axi_awsize  [2]),
+    .S02_AXI_awburst  (fifo_axi_awburst [2]),
+    .S02_AXI_awlock   (fifo_axi_awlock  [2]),
+    .S02_AXI_awcache  (fifo_axi_awcache [2]),
+    .S02_AXI_awprot   (fifo_axi_awprot  [2]),
+    .S02_AXI_awqos    (fifo_axi_awqos   [2]),
+    .S02_AXI_awregion (fifo_axi_awregion[2]),
+    .S02_AXI_awvalid  (fifo_axi_awvalid [2]),
+    .S02_AXI_awready  (fifo_axi_awready [2]),
+    .S02_AXI_wdata    (fifo_axi_wdata   [2]),
+    .S02_AXI_wstrb    (fifo_axi_wstrb   [2]),
+    .S02_AXI_wlast    (fifo_axi_wlast   [2]),
+    .S02_AXI_wvalid   (fifo_axi_wvalid  [2]),
+    .S02_AXI_wready   (fifo_axi_wready  [2]),
+    .S02_AXI_bid      (fifo_axi_bid     [2]),
+    .S02_AXI_bresp    (fifo_axi_bresp   [2]),
+    .S02_AXI_bvalid   (fifo_axi_bvalid  [2]),
+    .S02_AXI_bready   (fifo_axi_bready  [2]),
+    .S02_AXI_arid     (fifo_axi_arid    [2]),
+    .S02_AXI_araddr   (fifo_axi_araddr  [2]),
+    .S02_AXI_arlen    (fifo_axi_arlen   [2]),
+    .S02_AXI_arsize   (fifo_axi_arsize  [2]),
+    .S02_AXI_arburst  (fifo_axi_arburst [2]),
+    .S02_AXI_arlock   (fifo_axi_arlock  [2]),
+    .S02_AXI_arcache  (fifo_axi_arcache [2]),
+    .S02_AXI_arprot   (fifo_axi_arprot  [2]),
+    .S02_AXI_arqos    (fifo_axi_arqos   [2]),
+    .S02_AXI_arregion (fifo_axi_arregion[2]),
+    .S02_AXI_arvalid  (fifo_axi_arvalid [2]),
+    .S02_AXI_arready  (fifo_axi_arready [2]),
+    .S02_AXI_rid      (fifo_axi_rid     [2]),
+    .S02_AXI_rdata    (fifo_axi_rdata   [2]),
+    .S02_AXI_rresp    (fifo_axi_rresp   [2]),
+    .S02_AXI_rlast    (fifo_axi_rlast   [2]),
+    .S02_AXI_rvalid   (fifo_axi_rvalid  [2]),
+    .S02_AXI_rready   (fifo_axi_rready  [2]),
+    //
+    .S03_AXI_ACLK     (ddr3_dma_clk        ),
+    .S03_AXI_ARESETN  (~ddr3_dma_rst       ),
+    .S03_AXI_awid     (fifo_axi_awid    [3]),
+    .S03_AXI_awaddr   (fifo_axi_awaddr  [3]),
+    .S03_AXI_awlen    (fifo_axi_awlen   [3]),
+    .S03_AXI_awsize   (fifo_axi_awsize  [3]),
+    .S03_AXI_awburst  (fifo_axi_awburst [3]),
+    .S03_AXI_awlock   (fifo_axi_awlock  [3]),
+    .S03_AXI_awcache  (fifo_axi_awcache [3]),
+    .S03_AXI_awprot   (fifo_axi_awprot  [3]),
+    .S03_AXI_awqos    (fifo_axi_awqos   [3]),
+    .S03_AXI_awregion (fifo_axi_awregion[3]),
+    .S03_AXI_awvalid  (fifo_axi_awvalid [3]),
+    .S03_AXI_awready  (fifo_axi_awready [3]),
+    .S03_AXI_wdata    (fifo_axi_wdata   [3]),
+    .S03_AXI_wstrb    (fifo_axi_wstrb   [3]),
+    .S03_AXI_wlast    (fifo_axi_wlast   [3]),
+    .S03_AXI_wvalid   (fifo_axi_wvalid  [3]),
+    .S03_AXI_wready   (fifo_axi_wready  [3]),
+    .S03_AXI_bid      (fifo_axi_bid     [3]),
+    .S03_AXI_bresp    (fifo_axi_bresp   [3]),
+    .S03_AXI_bvalid   (fifo_axi_bvalid  [3]),
+    .S03_AXI_bready   (fifo_axi_bready  [3]),
+    .S03_AXI_arid     (fifo_axi_arid    [3]),
+    .S03_AXI_araddr   (fifo_axi_araddr  [3]),
+    .S03_AXI_arlen    (fifo_axi_arlen   [3]),
+    .S03_AXI_arsize   (fifo_axi_arsize  [3]),
+    .S03_AXI_arburst  (fifo_axi_arburst [3]),
+    .S03_AXI_arlock   (fifo_axi_arlock  [3]),
+    .S03_AXI_arcache  (fifo_axi_arcache [3]),
+    .S03_AXI_arprot   (fifo_axi_arprot  [3]),
+    .S03_AXI_arqos    (fifo_axi_arqos   [3]),
+    .S03_AXI_arregion (fifo_axi_arregion[3]),
+    .S03_AXI_arvalid  (fifo_axi_arvalid [3]),
+    .S03_AXI_arready  (fifo_axi_arready [3]),
+    .S03_AXI_rid      (fifo_axi_rid     [3]),
+    .S03_AXI_rdata    (fifo_axi_rdata   [3]),
+    .S03_AXI_rresp    (fifo_axi_rresp   [3]),
+    .S03_AXI_rlast    (fifo_axi_rlast   [3]),
+    .S03_AXI_rvalid   (fifo_axi_rvalid  [3]),
+    .S03_AXI_rready   (fifo_axi_rready  [3]),
+    //
+    .M00_AXI_ACLK     (ddr3_axi_clk        ),
+    .M00_AXI_ARESETN  (~ddr3_axi_rst       ),
+    .M00_AXI_awid     (ddr3_axi_awid       ),
+    .M00_AXI_awaddr   (ddr3_axi_awaddr     ),
+    .M00_AXI_awlen    (ddr3_axi_awlen      ),
+    .M00_AXI_awsize   (ddr3_axi_awsize     ),
+    .M00_AXI_awburst  (ddr3_axi_awburst    ),
+    .M00_AXI_awlock   (ddr3_axi_awlock     ),
+    .M00_AXI_awcache  (ddr3_axi_awcache    ),
+    .M00_AXI_awprot   (ddr3_axi_awprot     ),
+    .M00_AXI_awqos    (ddr3_axi_awqos      ),
+    .M00_AXI_awregion (                    ),
+    .M00_AXI_awvalid  (ddr3_axi_awvalid    ),
+    .M00_AXI_awready  (ddr3_axi_awready    ),
+    .M00_AXI_wdata    (ddr3_axi_wdata      ),
+    .M00_AXI_wstrb    (ddr3_axi_wstrb      ),
+    .M00_AXI_wlast    (ddr3_axi_wlast      ),
+    .M00_AXI_wvalid   (ddr3_axi_wvalid     ),
+    .M00_AXI_wready   (ddr3_axi_wready     ),
+    .M00_AXI_bid      (ddr3_axi_bid        ),
+    .M00_AXI_bresp    (ddr3_axi_bresp      ),
+    .M00_AXI_bvalid   (ddr3_axi_bvalid     ),
+    .M00_AXI_bready   (ddr3_axi_bready     ),
+    .M00_AXI_arid     (ddr3_axi_arid       ),
+    .M00_AXI_araddr   (ddr3_axi_araddr     ),
+    .M00_AXI_arlen    (ddr3_axi_arlen      ),
+    .M00_AXI_arsize   (ddr3_axi_arsize     ),
+    .M00_AXI_arburst  (ddr3_axi_arburst    ),
+    .M00_AXI_arlock   (ddr3_axi_arlock     ),
+    .M00_AXI_arcache  (ddr3_axi_arcache    ),
+    .M00_AXI_arprot   (ddr3_axi_arprot     ),
+    .M00_AXI_arqos    (ddr3_axi_arqos      ),
+    .M00_AXI_arregion (                    ),
+    .M00_AXI_arvalid  (ddr3_axi_arvalid    ),
+    .M00_AXI_arready  (ddr3_axi_arready    ),
+    .M00_AXI_rid      (ddr3_axi_rid        ),
+    .M00_AXI_rdata    (ddr3_axi_rdata      ),
+    .M00_AXI_rresp    (ddr3_axi_rresp      ),
+    .M00_AXI_rlast    (ddr3_axi_rlast      ),
+    .M00_AXI_rvalid   (ddr3_axi_rvalid     ),
+    .M00_AXI_rready   (ddr3_axi_rready     )
+  );
+
+
+  generate
+    if (USE_REPLAY) begin
+
+      noc_block_replay #(
+        .NOC_ID            (64'h4E91_A000_0000_0004),
+        .NUM_REPLAY_BLOCKS (NUM_DRAM_FIFOS),
+        .STR_SINK_FIFOSIZE (11)
+      ) inst_noc_block_replay (
+        .bus_clk (bus_clk),
+        .bus_rst (bus_rst),
+        .ce_clk  (ddr3_dma_clk),
+        .ce_rst  (ddr3_dma_rst),
+
+        .i_tdata  (ioce_o_tdata[0]),
+        .i_tlast  (ioce_o_tlast[0]),
+        .i_tvalid (ioce_o_tvalid[0]),
+        .i_tready (ioce_o_tready[0]),
+        .o_tdata  (ioce_i_tdata[0]),
+        .o_tlast  (ioce_i_tlast[0]),
+        .o_tvalid (ioce_i_tvalid[0]),
+        .o_tready (ioce_i_tready[0]),
+
+        .m_axi_awid     ({fifo_axi_awid    [1], fifo_axi_awid    [0]}),
+        .m_axi_awaddr   ({fifo_axi_awaddr  [1], fifo_axi_awaddr  [0]}),
+        .m_axi_awlen    ({fifo_axi_awlen   [1], fifo_axi_awlen   [0]}),
+        .m_axi_awsize   ({fifo_axi_awsize  [1], fifo_axi_awsize  [0]}),
+        .m_axi_awburst  ({fifo_axi_awburst [1], fifo_axi_awburst [0]}),
+        .m_axi_awlock   ({fifo_axi_awlock  [1], fifo_axi_awlock  [0]}),
+        .m_axi_awcache  ({fifo_axi_awcache [1], fifo_axi_awcache [0]}),
+        .m_axi_awprot   ({fifo_axi_awprot  [1], fifo_axi_awprot  [0]}),
+        .m_axi_awqos    ({fifo_axi_awqos   [1], fifo_axi_awqos   [0]}),
+        .m_axi_awregion ({fifo_axi_awregion[1], fifo_axi_awregion[0]}),
+        .m_axi_awuser   ({fifo_axi_awuser  [1], fifo_axi_awuser  [0]}),
+        .m_axi_awvalid  ({fifo_axi_awvalid [1], fifo_axi_awvalid [0]}),
+        .m_axi_awready  ({fifo_axi_awready [1], fifo_axi_awready [0]}),
+        .m_axi_wdata    ({fifo_axi_wdata   [1], fifo_axi_wdata   [0]}),
+        .m_axi_wstrb    ({fifo_axi_wstrb   [1], fifo_axi_wstrb   [0]}),
+        .m_axi_wlast    ({fifo_axi_wlast   [1], fifo_axi_wlast   [0]}),
+        .m_axi_wuser    ({fifo_axi_wuser   [1], fifo_axi_wuser   [0]}),
+        .m_axi_wvalid   ({fifo_axi_wvalid  [1], fifo_axi_wvalid  [0]}),
+        .m_axi_wready   ({fifo_axi_wready  [1], fifo_axi_wready  [0]}),
+        .m_axi_bid      ({fifo_axi_bid     [1], fifo_axi_bid     [0]}),
+        .m_axi_bresp    ({fifo_axi_bresp   [1], fifo_axi_bresp   [0]}),
+        .m_axi_buser    ({fifo_axi_buser   [1], fifo_axi_buser   [0]}),
+        .m_axi_bvalid   ({fifo_axi_bvalid  [1], fifo_axi_bvalid  [0]}),
+        .m_axi_bready   ({fifo_axi_bready  [1], fifo_axi_bready  [0]}),
+        .m_axi_arid     ({fifo_axi_arid    [1], fifo_axi_arid    [0]}),
+        .m_axi_araddr   ({fifo_axi_araddr  [1], fifo_axi_araddr  [0]}),
+        .m_axi_arlen    ({fifo_axi_arlen   [1], fifo_axi_arlen   [0]}),
+        .m_axi_arsize   ({fifo_axi_arsize  [1], fifo_axi_arsize  [0]}),
+        .m_axi_arburst  ({fifo_axi_arburst [1], fifo_axi_arburst [0]}),
+        .m_axi_arlock   ({fifo_axi_arlock  [1], fifo_axi_arlock  [0]}),
+        .m_axi_arcache  ({fifo_axi_arcache [1], fifo_axi_arcache [0]}),
+        .m_axi_arprot   ({fifo_axi_arprot  [1], fifo_axi_arprot  [0]}),
+        .m_axi_arqos    ({fifo_axi_arqos   [1], fifo_axi_arqos   [0]}),
+        .m_axi_arregion ({fifo_axi_arregion[1], fifo_axi_arregion[0]}),
+        .m_axi_aruser   ({fifo_axi_aruser  [1], fifo_axi_aruser  [0]}),
+        .m_axi_arvalid  ({fifo_axi_arvalid [1], fifo_axi_arvalid [0]}),
+        .m_axi_arready  ({fifo_axi_arready [1], fifo_axi_arready [0]}),
+        .m_axi_rid      ({fifo_axi_rid     [1], fifo_axi_rid     [0]}),
+        .m_axi_rdata    ({fifo_axi_rdata   [1], fifo_axi_rdata   [0]}),
+        .m_axi_rresp    ({fifo_axi_rresp   [1], fifo_axi_rresp   [0]}),
+        .m_axi_rlast    ({fifo_axi_rlast   [1], fifo_axi_rlast   [0]}),
+        .m_axi_ruser    ({fifo_axi_ruser   [1], fifo_axi_ruser   [0]}),
+        .m_axi_rvalid   ({fifo_axi_rvalid  [1], fifo_axi_rvalid  [0]}),
+        .m_axi_rready   ({fifo_axi_rready  [1], fifo_axi_rready  [0]}),
+
+        .debug ()
+      );
+
+    end else begin
+
+
+  noc_block_axi_dma_fifo #(
+    .NOC_ID               (64'hF1F0_D000_0000_0000),
+    .NUM_FIFOS            (NUM_DRAM_FIFOS),
+    .BUS_CLK_RATE         (BUS_CLK_RATE),
+    .DEFAULT_FIFO_BASE    ({30'h06000000, 30'h04000000, 30'h02000000, 30'h00000000}),
+    .DEFAULT_FIFO_SIZE    ({30'h01FFFFFF, 30'h01FFFFFF, 30'h01FFFFFF, 30'h01FFFFFF}),
+    .STR_SINK_FIFOSIZE    (DRAM_FIFO_INPUT_BUFF_SIZE),
+    .DEFAULT_BURST_TIMEOUT({NUM_DRAM_FIFOS{12'd280}}),
+    .EXTENDED_DRAM_BIST   (1)
+  ) noc_block_dram_fifo_i (
+    // Clocks and resets
+    .bus_clk(bus_clk), .bus_rst(bus_rst),
+    .ce_clk(ddr3_dma_clk), .ce_rst(ddr3_dma_rst),
+    // AXI-Stream interface to the RFNoC crossbar
+    .i_tdata(ioce_o_tdata[0]), .i_tlast(ioce_o_tlast[0]), .i_tvalid(ioce_o_tvalid[0]), .i_tready(ioce_o_tready[0]),
+    .o_tdata(ioce_i_tdata[0]), .o_tlast(ioce_i_tlast[0]), .o_tvalid(ioce_i_tvalid[0]), .o_tready(ioce_i_tready[0]),
+    // AXI-MM interface to the MIG crossbar
+    .m_axi_awid     ({fifo_axi_awid    [1], fifo_axi_awid    [0]}),
+    .m_axi_awaddr   ({fifo_axi_awaddr  [1], fifo_axi_awaddr  [0]}),
+    .m_axi_awlen    ({fifo_axi_awlen   [1], fifo_axi_awlen   [0]}),
+    .m_axi_awsize   ({fifo_axi_awsize  [1], fifo_axi_awsize  [0]}),
+    .m_axi_awburst  ({fifo_axi_awburst [1], fifo_axi_awburst [0]}),
+    .m_axi_awlock   ({fifo_axi_awlock  [1], fifo_axi_awlock  [0]}),
+    .m_axi_awcache  ({fifo_axi_awcache [1], fifo_axi_awcache [0]}),
+    .m_axi_awprot   ({fifo_axi_awprot  [1], fifo_axi_awprot  [0]}),
+    .m_axi_awqos    ({fifo_axi_awqos   [1], fifo_axi_awqos   [0]}),
+    .m_axi_awregion ({fifo_axi_awregion[1], fifo_axi_awregion[0]}),
+    .m_axi_awuser   ({fifo_axi_awuser  [1], fifo_axi_awuser  [0]}),
+    .m_axi_awvalid  ({fifo_axi_awvalid [1], fifo_axi_awvalid [0]}),
+    .m_axi_awready  ({fifo_axi_awready [1], fifo_axi_awready [0]}),
+    .m_axi_wdata    ({fifo_axi_wdata   [1], fifo_axi_wdata   [0]}),
+    .m_axi_wstrb    ({fifo_axi_wstrb   [1], fifo_axi_wstrb   [0]}),
+    .m_axi_wlast    ({fifo_axi_wlast   [1], fifo_axi_wlast   [0]}),
+    .m_axi_wuser    ({fifo_axi_wuser   [1], fifo_axi_wuser   [0]}),
+    .m_axi_wvalid   ({fifo_axi_wvalid  [1], fifo_axi_wvalid  [0]}),
+    .m_axi_wready   ({fifo_axi_wready  [1], fifo_axi_wready  [0]}),
+    .m_axi_bid      ({fifo_axi_bid     [1], fifo_axi_bid     [0]}),
+    .m_axi_bresp    ({fifo_axi_bresp   [1], fifo_axi_bresp   [0]}),
+    .m_axi_buser    ({fifo_axi_buser   [1], fifo_axi_buser   [0]}),
+    .m_axi_bvalid   ({fifo_axi_bvalid  [1], fifo_axi_bvalid  [0]}),
+    .m_axi_bready   ({fifo_axi_bready  [1], fifo_axi_bready  [0]}),
+    .m_axi_arid     ({fifo_axi_arid    [1], fifo_axi_arid    [0]}),
+    .m_axi_araddr   ({fifo_axi_araddr  [1], fifo_axi_araddr  [0]}),
+    .m_axi_arlen    ({fifo_axi_arlen   [1], fifo_axi_arlen   [0]}),
+    .m_axi_arsize   ({fifo_axi_arsize  [1], fifo_axi_arsize  [0]}),
+    .m_axi_arburst  ({fifo_axi_arburst [1], fifo_axi_arburst [0]}),
+    .m_axi_arlock   ({fifo_axi_arlock  [1], fifo_axi_arlock  [0]}),
+    .m_axi_arcache  ({fifo_axi_arcache [1], fifo_axi_arcache [0]}),
+    .m_axi_arprot   ({fifo_axi_arprot  [1], fifo_axi_arprot  [0]}),
+    .m_axi_arqos    ({fifo_axi_arqos   [1], fifo_axi_arqos   [0]}),
+    .m_axi_arregion ({fifo_axi_arregion[1], fifo_axi_arregion[0]}),
+    .m_axi_aruser   ({fifo_axi_aruser  [1], fifo_axi_aruser  [0]}),
+    .m_axi_arvalid  ({fifo_axi_arvalid [1], fifo_axi_arvalid [0]}),
+    .m_axi_arready  ({fifo_axi_arready [1], fifo_axi_arready [0]}),
+    .m_axi_rid      ({fifo_axi_rid     [1], fifo_axi_rid     [0]}),
+    .m_axi_rdata    ({fifo_axi_rdata   [1], fifo_axi_rdata   [0]}),
+    .m_axi_rresp    ({fifo_axi_rresp   [1], fifo_axi_rresp   [0]}),
+    .m_axi_rlast    ({fifo_axi_rlast   [1], fifo_axi_rlast   [0]}),
+    .m_axi_ruser    ({fifo_axi_ruser   [1], fifo_axi_ruser   [0]}),
+    .m_axi_rvalid   ({fifo_axi_rvalid  [1], fifo_axi_rvalid  [0]}),
+    .m_axi_rready   ({fifo_axi_rready  [1], fifo_axi_rready  [0]}),
+    // Misc
+    .debug()
+  );
+  end
+endgenerate
 
   ////////////////////////////////////////////////////////////////////////
   //

@@ -23,42 +23,30 @@ set_input_jitter TCXO_CLK 0.100
 # Rename Clocks
 ###############################################################################
 
-create_clock -period 10.000 \
-             -name bus_clk [get_pins {e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/FCLKCLK[0]}]
+create_clock -period 10.000 -name bus_clk [get_pins {e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/FCLKCLK[0]}]
 set_input_jitter bus_clk 0.300
 
-create_clock -period 25.000 \
-             -name clk40 [get_pins {e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/FCLKCLK[1]}]
+create_clock -period 25.000 -name clk40 [get_pins {e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/FCLKCLK[1]}]
 set_input_jitter clk40 0.750
 
-#create_clock -period 5.000 \
-#             -name bus_clk [get_pins {e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/FCLKCLK[3]}]
+#create_clock -period 5.000 #             -name bus_clk [get_pins {e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/FCLKCLK[3]}]
 #set_input_jitter bus_clk 0.150
 
 ###############################################################################
 # Timing Constraints for E310 daughter board signals
 ###############################################################################
 # CAT_DATA_CLK is the data clock from AD9361, sample rate dependent with a max rate of 61.44 MHz
-set cat_data_clk_period             16.276;
-set cat_data_clk_duty_cycle_var     [expr $cat_data_clk_period * (0.55 - 0.45)];
-set tcxo_jitter                     0.0005;     # Calculated from datasheet phase noise
-create_clock -period $cat_data_clk_period -name CAT_DATA_CLK [get_ports CAT_DATA_CLK]
+create_clock -period 16.276 -name CAT_DATA_CLK [get_ports CAT_DATA_CLK]
 # Model variable duty cycle as jitter.
-set_input_jitter CAT_DATA_CLK [expr $cat_data_clk_duty_cycle_var + $tcxo_jitter]
+set_input_jitter CAT_DATA_CLK 1.628
 
 # Generate DAC output clock
-create_generated_clock -name CAT_FB_CLK -multiply_by 1 -source [get_pins e310_io/oddr_clk/C] [get_ports CAT_FB_CLK]
+create_generated_clock -name CAT_FB_CLK -source [get_pins e310_io/oddr_clk/C] -multiply_by 1 [get_ports CAT_FB_CLK]
 
 # Asynchronous clock domains
-set_clock_groups -asynchronous \
-    -group [get_clocks -include_generated_clocks CAT_DATA_CLK] \
-    -group [get_clocks -include_generated_clocks bus_clk] \
-    -group [get_clocks -include_generated_clocks TCXO_CLK]
+set_clock_groups -asynchronous -group [get_clocks -include_generated_clocks CAT_DATA_CLK] -group [get_clocks -include_generated_clocks bus_clk] -group [get_clocks -include_generated_clocks TCXO_CLK]
 
-set_clock_groups -asynchronous \
-  -group [get_clocks -include_generated_clocks *clk_200M_o] \
-  -group [get_clocks -include_generated_clocks pps_ext] \
-  -group [get_clocks -include_generated_clocks gps_pps]
+set_clock_groups -asynchronous -group [get_clocks -include_generated_clocks *clk_200M_o] -group [get_clocks -include_generated_clocks pps_ext] -group [get_clocks -include_generated_clocks gps_pps]
 
 
 #TODO: I don't think this was getting used on E310
@@ -67,23 +55,17 @@ set_clock_groups -asynchronous \
 #set_clock_groups -logically_exclusive #  -group [get_clocks -include_generated_clocks {clk0}] #  -group [get_clocks -include_generated_clocks {clkdv}]
 
 # Setup ADC (AD9361) interface constraints.
-set cat_data_prog_dly               4.5;  # Programmable skew in AD9361 set to delay RX data by 4.5 ns
-set cat_data_clk_to_data_out_min    0;
-set cat_data_clk_to_data_out_max    1.2;
 
-set_input_delay -clock [get_clocks CAT_DATA_CLK] -max [expr $cat_data_prog_dly + $cat_data_clk_to_data_out_max] [get_ports {CAT_P0_D* CAT_RX_FRAME}]
-set_input_delay -clock [get_clocks CAT_DATA_CLK] -min [expr $cat_data_prog_dly + $cat_data_clk_to_data_out_min] [get_ports {CAT_P0_D* CAT_RX_FRAME}]
-set_input_delay -clock [get_clocks CAT_DATA_CLK] -max [expr $cat_data_prog_dly + $cat_data_clk_to_data_out_max] [get_ports {CAT_P0_D* CAT_RX_FRAME}] -clock_fall -add_delay
-set_input_delay -clock [get_clocks CAT_DATA_CLK] -min [expr $cat_data_prog_dly + $cat_data_clk_to_data_out_min] [get_ports {CAT_P0_D* CAT_RX_FRAME}] -clock_fall -add_delay
+set_input_delay -clock [get_clocks CAT_DATA_CLK] -max 5.700 [get_ports {CAT_P0_D* CAT_RX_FRAME}]
+set_input_delay -clock [get_clocks CAT_DATA_CLK] -min 4.500 [get_ports {CAT_P0_D* CAT_RX_FRAME}]
+set_input_delay -clock [get_clocks CAT_DATA_CLK] -clock_fall -max -add_delay 5.700 [get_ports {CAT_P0_D* CAT_RX_FRAME}]
+set_input_delay -clock [get_clocks CAT_DATA_CLK] -clock_fall -min -add_delay 4.500 [get_ports {CAT_P0_D* CAT_RX_FRAME}]
 
-set cat_fb_data_prog_dly            4.5;  # Programmable skew in AD9361 set to delay TX data by 4.5 ns
-set cat_fb_data_setup               1.0;
-set cat_fb_data_hold                0;
 
-set_output_delay -clock CAT_FB_CLK -max [expr $cat_fb_data_prog_dly + $cat_fb_data_setup] [get_ports {CAT_P1_D* CAT_TX_FRAME}]
-set_output_delay -clock CAT_FB_CLK -min [expr $cat_fb_data_prog_dly - $cat_fb_data_hold]  [get_ports {CAT_P1_D* CAT_TX_FRAME}]
-set_output_delay -clock CAT_FB_CLK -max [expr $cat_fb_data_prog_dly + $cat_fb_data_setup] [get_ports {CAT_P1_D* CAT_TX_FRAME}] -clock_fall -add_delay;
-set_output_delay -clock CAT_FB_CLK -min [expr $cat_fb_data_prog_dly - $cat_fb_data_hold]  [get_ports {CAT_P1_D* CAT_TX_FRAME}] -clock_fall -add_delay;
+set_output_delay -clock CAT_FB_CLK -max 5.500 [get_ports {CAT_P1_D* CAT_TX_FRAME}]
+set_output_delay -clock CAT_FB_CLK -min 4.500 [get_ports {CAT_P1_D* CAT_TX_FRAME}]
+set_output_delay -clock CAT_FB_CLK -clock_fall -max -add_delay 5.500 [get_ports {CAT_P1_D* CAT_TX_FRAME}]
+set_output_delay -clock CAT_FB_CLK -clock_fall -min -add_delay 4.500 [get_ports {CAT_P1_D* CAT_TX_FRAME}]
 
 # TODO: CAT SPI
 # Xilinx doesn't allow you to fully constrain EMIO because the internal SPI
@@ -91,32 +73,24 @@ set_output_delay -clock CAT_FB_CLK -min [expr $cat_fb_data_prog_dly - $cat_fb_da
 # compatible values.
 
 # Transceiver SPI
-set_max_delay -from [get_pins e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/EMIOSPI0MO] \
-              -to [get_ports CAT_MOSI] 10.000 -datapath_only
+set_max_delay -datapath_only -from [get_pins e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/EMIOSPI0MO] -to [get_ports CAT_MOSI] 10.000
 set_min_delay -to [get_ports CAT_MOSI] 1.000
 #
-set_max_delay -from [get_pins e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/EMIOSPI0SCLKO] \
-              -to [get_ports CAT_SCLK] 10.000 -datapath_only
+set_max_delay -datapath_only -from [get_pins e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/EMIOSPI0SCLKO] -to [get_ports CAT_SCLK] 10.000
 set_min_delay -to [get_ports CAT_SCLK] 1.000
 #
-set_max_delay -from [get_pins {e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/EMIOSPI0SSON[0]}] \
-              -to [get_ports CAT_CS] 10.000 -datapath_only
+set_max_delay -datapath_only -from [get_pins {e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/EMIOSPI0SSON[0]}] -to [get_ports CAT_CS] 10.000
 set_min_delay -to [get_ports CAT_CS] 1.000
 #
-set_max_delay -from [get_ports CAT_MISO] \
-              -to [get_pins e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/EMIOSPI0MI] 10.000 -datapath_only
-set_min_delay -from [get_ports CAT_MISO] \
-              -to [get_pins e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/EMIOSPI0MI] 1.000
+set_max_delay -datapath_only -from [get_ports CAT_MISO] -to [get_pins e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/EMIOSPI0MI] 10.000
+set_min_delay -from [get_ports CAT_MISO] -to [get_pins e31x_ps_bd_inst/processing_system7_0/inst/PS7_i/EMIOSPI0MI] 1.000
 
 ###############################################################################
 # PPS and Ref Clk Input Timing
 ###############################################################################
 
 # Asynchronous clock domains
-set_clock_groups -asynchronous \
-    -group [get_clocks -include_generated_clocks bus_clk] \
-    -group [get_clocks -include_generated_clocks pps_ext] \
-    -group [get_clocks -include_generated_clocks gps_pps]
+set_clock_groups -asynchronous -group [get_clocks -include_generated_clocks bus_clk] -group [get_clocks -include_generated_clocks pps_ext] -group [get_clocks -include_generated_clocks gps_pps]
 
 # TCXO DAC SPI
 # 12 MHz SPI clock rate
@@ -124,13 +98,13 @@ set_max_delay -datapath_only -from [all_registers -edge_triggered] -to [get_port
 set_min_delay -from [all_registers -edge_triggered] -to [get_ports TCXO_DAC*] 1.000
 
 # User GPIO
-set_max_delay -datapath_only -to   [get_ports PL_GPIO*] -from [all_registers -edge_triggered] [expr 15.0]
-set_min_delay                -to   [get_ports PL_GPIO*] -from [all_registers -edge_triggered] 5.0
-set_max_delay -datapath_only -from [get_ports PL_GPIO*] -to   [all_registers -edge_triggered] [expr 15.0]
-set_min_delay                -from [get_ports PL_GPIO*] -to   [all_registers -edge_triggered] 5.0
+set_max_delay -datapath_only -from [all_registers -edge_triggered] -to [get_ports PL_GPIO*] 15.000
+set_min_delay -from [all_registers -edge_triggered] -to [get_ports PL_GPIO*] 5.000
+set_max_delay -datapath_only -from [get_ports PL_GPIO*] -to [all_registers -edge_triggered] 15.000
+set_min_delay -from [get_ports PL_GPIO*] -to [all_registers -edge_triggered] 5.000
 
 # GPIO muxing
-set_max_delay -from [get_pins e31x_core_inst/fp_gpio_src_reg_reg[*]/C] -to [get_clocks CAT_DATA_CLK] $cat_data_clk_period -datapath_only
+set_max_delay -datapath_only -from [get_pins {e31x_core_inst/fp_gpio_src_reg_reg[*]/C}] -to [get_clocks CAT_DATA_CLK] 16.276
 
 ###############################################################################
 # False Paths
@@ -155,3 +129,22 @@ set_false_path -to [get_ports LED_*]
 set_false_path -to [get_ports VCRX*]
 set_false_path -to [get_ports VCTX*]
 set_false_path -from [get_ports ONSWITCH_DB]
+
+create_debug_core u_ila_0 ila
+set_property ALL_PROBE_SAME_MU true [get_debug_cores u_ila_0]
+set_property ALL_PROBE_SAME_MU_CNT 4 [get_debug_cores u_ila_0]
+set_property C_ADV_TRIGGER true [get_debug_cores u_ila_0]
+set_property C_DATA_DEPTH 1024 [get_debug_cores u_ila_0]
+set_property C_EN_STRG_QUAL true [get_debug_cores u_ila_0]
+set_property C_INPUT_PIPE_STAGES 0 [get_debug_cores u_ila_0]
+set_property C_TRIGIN_EN false [get_debug_cores u_ila_0]
+set_property C_TRIGOUT_EN false [get_debug_cores u_ila_0]
+set_property port_width 1 [get_debug_ports u_ila_0/clk]
+connect_debug_port u_ila_0/clk [get_nets [list u_mig_7series_0/u_mig_7series_0_mig/u_ddr3_infrastructure/CLK]]
+set_property PROBE_TYPE DATA_AND_TRIGGER [get_debug_ports u_ila_0/probe0]
+set_property port_width 1 [get_debug_ports u_ila_0/probe0]
+connect_debug_port u_ila_0/probe0 [get_nets [list ddr3_running]]
+set_property C_CLK_INPUT_FREQ_HZ 300000000 [get_debug_cores dbg_hub]
+set_property C_ENABLE_CLK_DIVIDER false [get_debug_cores dbg_hub]
+set_property C_USER_SCAN_CHAIN 1 [get_debug_cores dbg_hub]
+connect_debug_port dbg_hub/clk [get_nets ddr3_axi_clk]

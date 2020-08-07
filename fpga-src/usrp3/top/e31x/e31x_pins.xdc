@@ -505,3 +505,4 @@ set_property PULLDOWN true [get_ports {PL_GPIO[3]}]
 set_property PULLDOWN true [get_ports {PL_GPIO[4]}]
 set_property PULLDOWN true [get_ports {PL_GPIO[5]}]
 
+

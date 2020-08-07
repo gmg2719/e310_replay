@@ -36,21 +36,26 @@ module e31x (
   inout         DDR_VRN,
 
   // PL DDR
-  //input         PL_DDR3_SYSCLK,
-  //output        PL_DDR3_RESET_N,
-  //inout [15:0]  PL_DDR3_DQ,
-  //inout [1:0]   PL_DDR3_DQS_N,
-  //inout [1:0]   PL_DDR3_DQS_P,
-  //output [14:0] PL_DDR3_ADDR,
-  //output [2:0]  PL_DDR3_BA,
-  //output        PL_DDR3_RAS_N,
-  //output        PL_DDR3_CAS_N,
-  //output        PL_DDR3_WE_N,
-  //output [0:0]  PL_DDR3_CK_P,
-  //output [0:0]  PL_DDR3_CK_N,
-  //output [0:0]  PL_DDR3_CKE,
-  //output [1:0]  PL_DDR3_DM,
-  //output [0:0]  PL_DDR3_ODT,
+  input         sys_clk_i,
+  //
+  inout  [15:0] ddr3_dq,
+  inout  [1:0]  ddr3_dqs_n,
+  inout  [1:0]  ddr3_dqs_p,
+  output [1:0]  ddr3_dm,
+  //
+  output [2:0]  ddr3_ba,
+  output [14:0] ddr3_addr,
+  output        ddr3_ras_n,
+  output        ddr3_cas_n,
+  output        ddr3_we_n,
+  //
+  output [0:0]  ddr3_cke,
+  output [0:0]  ddr3_odt,
+  //
+  output [0:0]  ddr3_ck_p,
+  output [0:0]  ddr3_ck_n,
+  //
+  output        ddr3_reset_n,
 
   //AVR SPI IO
   input         AVR_CS_R,
@@ -150,9 +155,11 @@ module e31x (
 
   // Clocks
   wire bus_clk;
+  wire bus_clk_2x;
   wire radio_clk;
   wire reg_clk;
   wire clk40;
+  wire ddr3_dma_clk;
   wire FCLK_CLK0;
   wire FCLK_CLK1;
   wire FCLK_CLK2;
@@ -269,7 +276,8 @@ module e31x (
 
   assign clk40   = FCLK_CLK1;   // 40 MHz
   assign bus_clk = FCLK_CLK0;   // 100 MHz
-  //assign bus_clk = FCLK_CLK3;   // 200 MHz
+  assign bus_clk_2x = FCLK_CLK3;   // 200 MHz
+  assign ddr3_dma_clk = FCLK_CLK3;
   assign reg_clk = clk40;
 
   wire pps;
@@ -307,6 +315,157 @@ module e31x (
   always @ (posedge bus_clk)
     pps_reg <= bus_rst ? 3'b000 : {pps_reg[1:0], GPS_PPS};
   assign ps_gpio_in[8] = pps_reg[2]; // 62
+
+
+
+
+  //////////////////////////////////////////////////////////////////////
+  //
+  // PL DDR3 Memory Interface
+  // Added By Jiliang Wang 2020/07/23
+  //
+  ///////////////////////////////////////////////////////////////////////
+
+  wire         ddr3_axi_clk;                  // 1/4 DDR external clock rate
+  wire         ddr3_axi_rst; //used by core   // Synchronized to ddr_sys_clk
+  (*mark_debug = "true" *) wire         ddr3_running; //used by core   // DRAM calibration complete.
+  wire [11:0]  device_temp;
+
+  // Slave Interface Write Address Ports
+  wire [3:0]   ddr3_axi_awid;
+  wire [31:0]  ddr3_axi_awaddr;
+  wire [7:0]   ddr3_axi_awlen;
+  wire [2:0]   ddr3_axi_awsize;
+  wire [1:0]   ddr3_axi_awburst;
+  wire [0:0]   ddr3_axi_awlock;
+  wire [3:0]   ddr3_axi_awcache;
+  wire [2:0]   ddr3_axi_awprot;
+  wire [3:0]   ddr3_axi_awqos;
+  wire         ddr3_axi_awvalid;
+  wire         ddr3_axi_awready;
+  // Slave Interface Write Data Ports
+  wire [127:0] ddr3_axi_wdata;
+  wire [15:0]  ddr3_axi_wstrb;
+  wire         ddr3_axi_wlast;
+  wire         ddr3_axi_wvalid;
+  wire         ddr3_axi_wready;
+  // Slave Interface Write Response Ports
+  wire         ddr3_axi_bready;
+  wire [3:0]   ddr3_axi_bid;
+  wire [1:0]   ddr3_axi_bresp;
+  wire         ddr3_axi_bvalid;
+  // Slave Interface Read Address Ports
+  wire [3:0]   ddr3_axi_arid;
+  wire [31:0]  ddr3_axi_araddr;
+  wire [7:0]   ddr3_axi_arlen;
+  wire [2:0]   ddr3_axi_arsize;
+  wire [1:0]   ddr3_axi_arburst;
+  wire [0:0]   ddr3_axi_arlock;
+  wire [3:0]   ddr3_axi_arcache;
+  wire [2:0]   ddr3_axi_arprot;
+  wire [3:0]   ddr3_axi_arqos;
+  wire         ddr3_axi_arvalid;
+  wire         ddr3_axi_arready;
+  // Slave Interface Read Data Ports
+  wire         ddr3_axi_rready;
+  wire [3:0]   ddr3_axi_rid;
+  wire [127:0] ddr3_axi_rdata;
+  wire [1:0]   ddr3_axi_rresp;
+  wire         ddr3_axi_rlast;
+  wire         ddr3_axi_rvalid;
+
+  reg      ddr3_axi_rst_reg_n;
+
+  // Copied this reset circuit from example design.
+  always @(posedge ddr3_axi_clk)
+    ddr3_axi_rst_reg_n <= ~ddr3_axi_rst;
+
+  mig_7series_0 u_mig_7series_0 (
+    // Memory interface ports
+    .ddr3_addr           (ddr3_addr),
+    .ddr3_ba             (ddr3_ba),
+    .ddr3_cas_n          (ddr3_cas_n),
+    .ddr3_ck_n           (ddr3_ck_n),
+    .ddr3_ck_p           (ddr3_ck_p),
+    .ddr3_cke            (ddr3_cke),
+    .ddr3_ras_n          (ddr3_ras_n),
+    .ddr3_we_n           (ddr3_we_n),
+    .ddr3_dq             (ddr3_dq),
+    .ddr3_dqs_n          (ddr3_dqs_n),
+    .ddr3_dqs_p          (ddr3_dqs_p),
+    .ddr3_reset_n        (ddr3_reset_n),
+    .init_calib_complete (ddr3_running),
+
+//    .ddr3_cs_n           (ddr3_cs_n),
+    .ddr3_dm             (ddr3_dm),
+    .ddr3_odt            (ddr3_odt),
+    // Application interface ports
+    .ui_clk              (ddr3_axi_clk),
+    .ui_clk_sync_rst     (ddr3_axi_rst),
+    
+    .mmcm_locked         (),
+    .aresetn             (ddr3_axi_rst_reg_n),
+    .app_sr_req          (1'b0),
+    .app_ref_req         (1'b0),
+    .app_zq_req          (1'b0),
+    .app_sr_active       (),
+    .app_ref_ack         (),
+    .app_zq_ack          (),
+    // Slave Interface Write Address Ports
+    .s_axi_awid          (ddr3_axi_awid),
+    .s_axi_awaddr        (ddr3_axi_awaddr[28:0]),//
+    .s_axi_awlen         (ddr3_axi_awlen),
+    .s_axi_awsize        (ddr3_axi_awsize),
+    .s_axi_awburst       (ddr3_axi_awburst),
+    .s_axi_awlock        (ddr3_axi_awlock),
+    .s_axi_awcache       (ddr3_axi_awcache),
+    .s_axi_awprot        (ddr3_axi_awprot),
+    .s_axi_awqos         (ddr3_axi_awqos),//4'h0
+    .s_axi_awvalid       (ddr3_axi_awvalid),
+    .s_axi_awready       (ddr3_axi_awready),
+    // Slave Interface Write Data Ports
+    .s_axi_wdata         (ddr3_axi_wdata),
+    .s_axi_wstrb         (ddr3_axi_wstrb),
+    .s_axi_wlast         (ddr3_axi_wlast),
+    .s_axi_wvalid        (ddr3_axi_wvalid),
+    .s_axi_wready        (ddr3_axi_wready),
+    // Slave Interface Write Response Ports
+    .s_axi_bid           (ddr3_axi_bid),
+    .s_axi_bresp         (ddr3_axi_bresp),
+    .s_axi_bvalid        (ddr3_axi_bvalid),
+    .s_axi_bready        (ddr3_axi_bready),
+    // Slave Interface Read Address Ports
+    .s_axi_arid          (ddr3_axi_arid),
+    .s_axi_araddr        (ddr3_axi_araddr[28:0]),//
+    .s_axi_arlen         (ddr3_axi_arlen),
+    .s_axi_arsize        (ddr3_axi_arsize),
+    .s_axi_arburst       (ddr3_axi_arburst),
+    .s_axi_arlock        (ddr3_axi_arlock),
+    .s_axi_arcache       (ddr3_axi_arcache),
+    .s_axi_arprot        (ddr3_axi_arprot),
+    .s_axi_arqos         (ddr3_axi_arqos),//4'h0
+    .s_axi_arvalid       (ddr3_axi_arvalid),
+    .s_axi_arready       (ddr3_axi_arready),
+    // Slave Interface Read Data Ports
+    .s_axi_rid           (ddr3_axi_rid),
+    .s_axi_rdata         (ddr3_axi_rdata),
+    .s_axi_rresp         (ddr3_axi_rresp),
+    .s_axi_rlast         (ddr3_axi_rlast),
+    .s_axi_rvalid        (ddr3_axi_rvalid),
+    .s_axi_rready        (ddr3_axi_rready),
+    // System Clock Ports
+    .sys_clk_i           (sys_clk_i),
+    .clk_ref_i           (bus_clk_2x),
+    .device_temp         (device_temp),
+    //.sys_clk_p           (sys_clk_p),
+    //.sys_clk_n           (sys_clk_n),
+
+    .sys_rst             (bus_rst)
+  );
+
+
+
+
 
   /////////////////////////////////////////////////////////////////////
   //
@@ -720,6 +879,7 @@ module e31x (
     .NUM_CHANNELS_PER_RADIO(NUM_CHANNELS_PER_RADIO),
     .NUM_CHANNELS(NUM_CHANNELS),
     .NUM_DBOARDS(NUM_DBOARDS),
+    .USE_REPLAY(1),
     .FP_GPIO_WIDTH(FP_GPIO_WIDTH),
     .DB_GPIO_WIDTH(DB_GPIO_WIDTH)
   ) e31x_core_inst (
@@ -729,7 +889,7 @@ module e31x (
     .radio_rst(radio_rst),
     .bus_clk(bus_clk),
     .bus_rst(bus_rst),
-
+    .ddr3_dma_clk(ddr3_dma_clk),
     // Clocking and PPS Controls/Indicators
     .pps_refclk(pps),
     .refclk_locked(reflck),
@@ -759,6 +919,55 @@ module e31x (
     .s_axi_rresp(m_axi_xbar_rresp),
     .s_axi_rvalid(m_axi_xbar_rvalid),
     .s_axi_rready(m_axi_xbar_rready),
+
+
+
+    // DRAM signals
+    .ddr3_axi_clk              (ddr3_axi_clk),
+    .ddr3_axi_rst              (ddr3_axi_rst),
+    .ddr3_running              (ddr3_running),
+    // Slave Interface Write Address Ports
+    .ddr3_axi_awid             (ddr3_axi_awid),
+    .ddr3_axi_awaddr           (ddr3_axi_awaddr),
+    .ddr3_axi_awlen            (ddr3_axi_awlen),
+    .ddr3_axi_awsize           (ddr3_axi_awsize),
+    .ddr3_axi_awburst          (ddr3_axi_awburst),
+    .ddr3_axi_awlock           (ddr3_axi_awlock),
+    .ddr3_axi_awcache          (ddr3_axi_awcache),
+    .ddr3_axi_awprot           (ddr3_axi_awprot),
+    .ddr3_axi_awqos            (ddr3_axi_awqos),
+    .ddr3_axi_awvalid          (ddr3_axi_awvalid),
+    .ddr3_axi_awready          (ddr3_axi_awready),
+    // Slave Interface Write Data Ports
+    .ddr3_axi_wdata            (ddr3_axi_wdata),
+    .ddr3_axi_wstrb            (ddr3_axi_wstrb),
+    .ddr3_axi_wlast            (ddr3_axi_wlast),
+    .ddr3_axi_wvalid           (ddr3_axi_wvalid),
+    .ddr3_axi_wready           (ddr3_axi_wready),
+    // Slave Interface Write Response Ports
+    .ddr3_axi_bid              (ddr3_axi_bid),
+    .ddr3_axi_bresp            (ddr3_axi_bresp),
+    .ddr3_axi_bvalid           (ddr3_axi_bvalid),
+    .ddr3_axi_bready           (ddr3_axi_bready),
+    // Slave Interface Read Address Ports
+    .ddr3_axi_arid             (ddr3_axi_arid),
+    .ddr3_axi_araddr           (ddr3_axi_araddr),
+    .ddr3_axi_arlen            (ddr3_axi_arlen),
+    .ddr3_axi_arsize           (ddr3_axi_arsize),
+    .ddr3_axi_arburst          (ddr3_axi_arburst),
+    .ddr3_axi_arlock           (ddr3_axi_arlock),
+    .ddr3_axi_arcache          (ddr3_axi_arcache),
+    .ddr3_axi_arprot           (ddr3_axi_arprot),
+    .ddr3_axi_arqos            (ddr3_axi_arqos),
+    .ddr3_axi_arvalid          (ddr3_axi_arvalid),
+    .ddr3_axi_arready          (ddr3_axi_arready),
+    // Slave Interface Read Data Ports
+    .ddr3_axi_rid              (ddr3_axi_rid),
+    .ddr3_axi_rdata            (ddr3_axi_rdata),
+    .ddr3_axi_rresp            (ddr3_axi_rresp),
+    .ddr3_axi_rlast            (ddr3_axi_rlast),
+    .ddr3_axi_rvalid           (ddr3_axi_rvalid),
+    .ddr3_axi_rready           (ddr3_axi_rready),
 
     // Radio ATR
     .rx_atr(rx_atr),
